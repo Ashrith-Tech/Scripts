@@ -1,0 +1,85 @@
+# Path to the text file with list of server names (one per line)
+$serverList = "C:\Scripts\Uninstall\servers.txt"
+# Output Excel file for logging the results
+$outputExcel = "C:\Scripts\Uninstall\7Zip_Uninstall_Results.xlsx"
+
+# Import the ImportExcel module (ensure it's installed first)
+Import-Module -Name ImportExcel
+
+# Create an array to store the results
+$results = @()
+
+# Read the server names from the text file
+$servers = Get-Content -Path $serverList
+
+foreach ($server in $servers) {
+    Write-Host "Processing server: $server"
+    
+    # Initialize the result variables
+    $result = "Success"
+    $errorMessage = ""
+
+    try {
+        # Establish a remote session (using PowerShell remoting)
+        $session = New-PSSession -ComputerName $server
+
+        $uninstallResult = Invoke-Command -Session $session -ScriptBlock {
+            try {
+                # Determine if system is 64-bit
+                $64bit = if ([System.IntPtr]::Size -eq 8) { $true } else { $false }
+                $RegKeys = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\')
+                if ($64bit) { $RegKeys += 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\' }
+                
+                # Retrieve 7-Zip uninstall information
+                $Apps = $RegKeys | Get-ChildItem | Get-ItemProperty | Where-Object { $_.DisplayName -like '*7-Zip*' }
+                
+                if ($Apps) {
+                    Write-Host "Uninstalling 7-Zip..."
+                    $Apps | ForEach-Object {
+                        $ExecLocation = "$($_.UninstallString.Split('"')[1])"
+                        Start-Process -FilePath "$ExecLocation" -ArgumentList "/S" -Wait
+                    }
+                    
+                    # Verify uninstallation
+                    Start-Sleep -Seconds 10
+                    $zipCheck = $RegKeys | Get-ChildItem | Get-ItemProperty | Where-Object { $_.DisplayName -like '*7-Zip*' }
+                    
+                    if (-not $zipCheck) {
+                        Write-Host "7-Zip has been successfully uninstalled."
+                        return "Success"
+                    } else {
+                        Write-Host "7-Zip uninstallation failed."
+                        return "Failure"
+                    }
+                } else {
+                    Write-Host "7-Zip not found on this system."
+                    return "Not Found"
+                }
+            } catch {
+                Write-Host "An error occurred: $($_.Exception.Message)"
+                return "Error"
+            }
+        }
+
+        # Capture the result and add to the results array
+        $result = $uninstallResult
+    } catch {
+        $result = "Error"
+        $errorMessage = $_.Exception.Message
+    } finally {
+        # Add the result to the array
+        $results += [PSCustomObject]@{
+            ServerName = $server
+            Result     = $result
+            ErrorMessage = $errorMessage
+        }
+    }
+
+    # Clean up the session
+    Remove-PSSession -Session $session
+}
+
+# Export the results to Excel
+$results | Export-Excel -Path $outputExcel -WorksheetName "UninstallResults" -AutoSize -TableName "7ZipResults"
+
+Write-Host "Uninstallation process completed. Results saved to $outputExcel."

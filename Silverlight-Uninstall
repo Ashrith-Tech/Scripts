@@ -1,0 +1,75 @@
+# Path to the text file with list of server names (one per line)
+$serverList = "C:\temp\Scripts\Application vulnerabilities\Final Application scripts\servers.txt"
+# Output Excel file for logging the results
+$outputExcel = "C:\temp\Scripts\Application vulnerabilities\Final Application scripts\Silverlight_Uninstall_Results.xlsx"
+
+# Import the ImportExcel module (ensure it's installed first)
+Import-Module -Name ImportExcel
+
+# Create an array to store the results
+$results = @()
+
+# Read the server names from the text file
+$servers = Get-Content -Path $serverList
+
+foreach ($server in $servers) {
+    Write-Host "Processing server: $server"
+    
+    # Initialize the result variables
+    $result = "Success"
+    $errorMessage = ""
+
+    try {
+        # Establish a remote session (using PowerShell remoting)
+        $session = New-PSSession -ComputerName $server
+
+        $uninstallResult = Invoke-Command -Session $session -ScriptBlock {
+            try {
+                # Check if Microsoft Silverlight is installed
+                $Silverlight = Get-WmiObject -Class Win32_Product -Filter "Name = 'Microsoft Silverlight'"
+                
+                if ($Silverlight) {
+                    Write-Host "Uninstalling Microsoft Silverlight..."
+                    # Uninstall Silverlight
+                    $UninstallResult = $Silverlight.Uninstall()
+                    
+                    # Check for successful uninstallation
+                    if ($UninstallResult.ReturnValue -eq 0) {
+                        Write-Host "Microsoft Silverlight has been successfully uninstalled."
+                        return "Success"
+                    } else {
+                        Write-Host "An error occurred during the uninstallation. Error code: $($UninstallResult.ReturnValue)"
+                        return "Failure"
+                    }
+                } else {
+                    Write-Host "Microsoft Silverlight not found on this system."
+                    return "Not Found"
+                }
+            } catch {
+                Write-Host "An error occurred: $($_.Exception.Message)"
+                return "Error"
+            }
+        } -ArgumentList $server
+
+        # Capture the result and add to the results array
+        $result = $uninstallResult
+    } catch {
+        $result = "Error"
+        $errorMessage = $_.Exception.Message
+    } finally {
+        # Add the result to the array
+        $results += [PSCustomObject]@{
+            ServerName = $server
+            Result     = $result
+            ErrorMessage = $errorMessage
+        }
+    }
+
+    # Clean up the session
+    Remove-PSSession -Session $session
+}
+
+# Export the results to Excel
+$results | Export-Excel -Path $outputExcel -WorksheetName "UninstallResults" -AutoSize -TableName "SilverlightResults"
+
+Write-Host "Uninstallation process completed. Results saved to $outputExcel."

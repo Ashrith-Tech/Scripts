@@ -1,0 +1,74 @@
+<#===========================================================================================================================
+ Script Name: ServerPatchReport.ps1
+ Description: Reports uptime, last date a patch was installed, and installed KB numbers on servers, exporting the output to an Excel file.
+      Inputs: List of server names fed from text file, one server name per line.
+     Outputs: Excel file with server name, uptime, date and time the patch was installed, days since last patch, and recent KB numbers.
+       Notes: Removed email functionality and added Excel export.
+=============================================================================================================================#>
+
+# Ensure ImportExcel module is installed
+if (!(Get-Module -ListAvailable -Name ImportExcel)) {
+    Install-Module -Name ImportExcel -Scope CurrentUser -Force
+}
+
+$ScriptPath = Get-Location
+$DateStampCSV = (Get-Date -Format "MMM-dd-yyyy")
+$FileDateStamp = Get-Date -Format yyyyMMdd
+$ServerList = Get-Content "$ScriptPath\ServerList.txt"
+$ExcelFile = "$ScriptPath\ServerPatchReport-$FileDateStamp.xlsx"
+
+# Set the number of days to check for recent updates
+$Days = 25
+
+# Initialize an array to store the report data
+$ReportData = @()
+
+Write-Host "Querying servers for installed updates...`n" -ForegroundColor Yellow
+
+ForEach ($Server in $ServerList) {
+    $InstalledOn = ""
+    $InstalledKBs = ""
+    Try {
+        Write-Host "Checking $Server..."
+        $BootTime = (Get-WmiObject win32_operatingSystem -computer $Server -ErrorAction Stop).lastbootuptime
+        $BootTime = [System.Management.ManagementDateTimeconverter]::ToDateTime($BootTime)
+        $Now = Get-Date
+        $span = New-TimeSpan $BootTime $Now
+        $Uptime = "$($span.Days) days $($span.Hours) hrs $($span.Minutes) mins"
+
+        $key = "SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\Results\Install"
+        $RemoteBase = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $Server)
+        $regKey = $RemoteBase.OpenSubKey($key)
+        $InstalledOn = Get-Date $regKey.GetValue("LastSuccessTime") -Format 'MM/dd/yyyy hh:mm:ss'
+    }
+    Catch {
+        $ServerLastUpdate = (Get-HotFix -ComputerName $Server | Sort-Object -Descending -Property InstalledOn -ErrorAction SilentlyContinue | Select-Object -First 1)
+        $InstalledOn = $ServerLastUpdate.InstalledOn
+    }
+    
+    if (-not $InstalledOn) { $InstalledOn = "Error collecting data"; $Uptime = "Error" }
+    
+    $DaySpanDays = if ($InstalledOn -is [datetime]) { (New-TimeSpan -Start $InstalledOn -End (Get-Date)).Days } else { "Error" }
+
+    # Get recently installed KB updates
+    Try {
+        $RecentUpdates = Get-HotFix -ComputerName $Server | Where-Object { $_.InstalledOn -ge (Get-Date).AddDays(-$Days) } | Select-Object -ExpandProperty HotFixID
+        $InstalledKBs = if ($RecentUpdates) { $RecentUpdates -join ", " } else { "No recent updates" }
+    }
+    Catch {
+        $InstalledKBs = "Error retrieving updates"
+    }
+    
+    # Add data to the report array
+    $ReportData += [PSCustomObject]@{
+        "Server Name"           = $Server
+        "Uptime"                = $Uptime
+        "Last Patch Date & Time" = $InstalledOn
+        "Days Since Last Patch"  = $DaySpanDays
+        "Recent KB Numbers"      = $InstalledKBs
+    }
+}
+
+Write-Host "Exporting data to Excel..." -ForegroundColor Yellow
+$ReportData | Export-Excel -Path $ExcelFile -AutoSize -BoldTopRow -WorksheetName "Patch Report"
+Write-Host "Report saved to $ExcelFile" -ForegroundColor Green

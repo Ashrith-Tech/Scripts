@@ -1,0 +1,58 @@
+$machines = Get-Content 'D:\Patching\Servers_List_Patching_Status.txt'
+$Patches = @(
+    'KB890830', # Windows Malicious Software Removal Tool x64 - v5.132 (KB890830)
+    'KB5052108', # 2025-02 Servicing Stack Update for Windows Server 2012 R2 for x64-based Systems (KB5052108)
+    'KB5052042', # 2025-02 Security Monthly Quality Rollup for Windows Server 2012 R2 for x64-based Systems (KB5052042)
+    'KB5052006', # 2025-02 Cumulative Update for Windows Server 2016 for x64-based Systems (KB5052006)
+    'KB5052000', # 2025-02 Cumulative Update for Windows Server 2019 for x64-based Systems (KB5052000)
+    'KB5051987', # 2025-02 Cumulative Update for Windows 11 Version 24H2 for x64-based Systems (KB5051987)
+    'KB5051979', # 2025-02 Cumulative Update for Microsoft server operating system version 21H2 for x64-based Systems (KB5051979)
+    'KB5051972'  # 2025-02 Cumulative Security Update for Internet Explorer 11 for Windows Server 2012 R2 for x64-based systems (KB5051972)
+)
+$report = @()
+
+foreach ($server in $machines) {
+    Write-Output $server
+
+    $osInfo = Get-WmiObject win32_operatingsystem -ComputerName $server
+    $lastBootTime = $osInfo.LastBootUpTime
+    $osVersion = $osInfo.Caption
+
+    $lastBootTimeReadable = [Management.ManagementDateTimeConverter]::ToDateTime($lastBootTime).ToString("MM/dd/yyyy HH:mm:ss")
+
+    if ($osVersion -match '\b(2012 R2|2012|2016|2019|2022|2025)\b') {
+
+    if ($osVersion -match '2012 R2') {
+        $osYear = "2012 R2"
+    } else {
+        $osYear = $matches[0]
+    }
+} else {
+    $osYear = "Unknown"
+}
+
+    $installedKBs = Get-HotFix -Id $Patches -ComputerName $server | Select-Object -ExpandProperty HotFixID
+
+    if ($installedKBs.Count -gt 0) {
+        foreach ($kb in $installedKBs) {
+            $reportObject = New-Object PSObject -property @{
+                Server        = $server
+                OS            = $osYear
+                InstalledKBs  = $kb
+                LastBootTime  = $lastBootTimeReadable
+            }
+            $report += $reportObject
+        }
+    } else {
+        $reportObject = New-Object PSObject -property @{
+            Server        = $server
+            OS            = $osYear
+            InstalledKBs  = "None"
+            LastBootTime  = $lastBootTimeReadable
+        }
+        $report += $reportObject
+    }
+}
+
+$csvFilePath = 'D:\Ganesh\Patching\PatchingReport.csv'
+$report | Export-Csv -Path $csvFilePath -NoTypeInformation

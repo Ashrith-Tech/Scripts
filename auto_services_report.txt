@@ -1,0 +1,99 @@
+# Define input and output paths
+$serverListPath = "D:\Windows_Team\Scripts\Patching\Health checks\servers.txt"
+$outputHtmlPath = "D:\Windows_Team\Scripts\Patching\Health checks\ServiceHealthReport.html"
+
+# Read server names
+$servers = Get-Content $serverListPath
+
+# Create a list to hold job objects
+$jobs = @()
+
+# Start a job for each server
+foreach ($server in $servers) {
+    $job = Start-Job -ArgumentList $server -ScriptBlock {
+        param($srv)
+        try {
+            $services = Get-WmiObject -Class Win32_Service -ComputerName $srv | Where-Object {
+                $_.StartMode -eq "Auto" -and
+                ($_.DelayedAutoStart -eq $false -or $_.DelayedAutoStart -eq 0)
+            } | Where-Object {
+                -not (Test-Path -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$($_.Name)\TriggerInfo")
+            }
+
+            $stoppedServices = $services | Where-Object { $_.State -ne "Running" }
+
+            $os = Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $srv
+            $lastBoot = $os.LastBootUpTime
+            $uptime = (Get-Date) - $lastBoot
+
+            if ($stoppedServices.Count -eq 0) {
+                $status = "All automatic services are running"
+                $color = "lightgreen"
+            } else {
+                $stoppedNames = ($stoppedServices | Select-Object -ExpandProperty Name) -join ", "
+                $status = "Stopped services: $stoppedNames"
+                $color = "lightcoral"
+            }
+
+            [PSCustomObject]@{
+                ServerName = $srv
+                ServiceStatus = $status
+                Uptime = "$([math]::Round($uptime.TotalDays,2)) days"
+                RowColor = $color
+            }
+        }
+        catch {
+            [PSCustomObject]@{
+                ServerName = $srv
+                ServiceStatus = "Error connecting"
+                Uptime = "N/A"
+                RowColor = "lightcoral"
+            }
+        }
+    }
+    $jobs += $job
+}
+
+# Wait for all jobs to finish
+Wait-Job -Job $jobs
+
+# Collect results from all jobs
+$results = $jobs | Receive-Job
+
+# Clean up jobs
+Remove-Job -Job $jobs
+
+# Generate HTML output (same as before)
+$html = @"
+<html>
+<head>
+    <title>Windows Server Health Report</title>
+    <style>
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid black; padding: 8px; text-align: left; }
+    </style>
+</head>
+<body>
+    <h2>Windows Server Health Report</h2>
+    <table>
+        <tr>
+            <th>Server Name</th>
+            <th>Service Status</th>
+            <th>Uptime</th>
+        </tr>
+"@
+
+foreach ($result in $results) {
+    $html += "<tr style='background-color:$($result.RowColor)'><td>$($result.ServerName)</td><td>$($result.ServiceStatus)</td><td>$($result.Uptime)</td></tr>"
+}
+
+$html += @"
+    </table>
+</body>
+</html>
+"@
+
+# Save HTML
+$html | Out-File -FilePath $outputHtmlPath -Encoding UTF8
+
+Write-Host "Parallel report generated at $outputHtmlPath"

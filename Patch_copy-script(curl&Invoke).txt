@@ -1,0 +1,147 @@
+# User-configurable settings
+$ServersFile = "D:\Patching\Patch_copy_script\servers.txt"
+$PatchURL = "http://bcfdltcswin03.brunswick.com/patches/OS-2012.zip"
+$CentralLogFile = "D:\Patching\Patch_copy_script\PatchExecutionLog.txt"
+$CsvOutputFile = "D:\Patching\Patch_copy_script\PatchSummary.csv"
+
+# Initialize log buffer
+$Global:LogBuffer = @()
+
+function Log-Message {
+    param (
+        [string]$Message,
+        [ValidateSet("Green", "Yellow", "Red", "Cyan", "Gray")]
+        [string]$Color = "Cyan"
+    )
+    Write-Host $Message -ForegroundColor $Color
+    $Global:LogBuffer += "$(Get-Date -Format '[yyyy-MM-dd HH:mm:ss]') $Message"
+}
+
+function Write-CentralLog {
+    foreach ($Log in $Global:LogBuffer) {
+        Add-Content -Path $CentralLogFile -Value $Log
+    }
+    $Global:LogBuffer = @()
+}
+
+$PatchingScript = {
+    param (
+        [string]$PatchURL,
+        [string]$CentralLogFile
+    )
+
+    $LogBuffer = @()
+    function Log-RemoteMessage {
+        param (
+            [string]$Message,
+            [ValidateSet("Green", "Yellow", "Red", "Cyan", "Gray")]
+            [string]$Color = "Cyan"
+        )
+        $LogBuffer += "$(Get-Date -Format '[yyyy-MM-dd HH:mm:ss]')[Remote] $Message"
+        Write-Host $Message -ForegroundColor $Color
+    }
+
+    $Date = Get-Date -Format "yyyy-MM-dd"
+    $PatchFolder = "C:\Temp\${Date}_PatchFolder"
+    $ExtractedFolder = "$PatchFolder\Extracted"
+    $ZipPath = "$PatchFolder\patch.zip"
+
+    if (-not (Test-Path -Path $PatchFolder)) {
+        New-Item -Path $PatchFolder -ItemType Directory -Force | Out-Null
+        Log-RemoteMessage "Created patch folder: $PatchFolder" "Cyan"
+    }
+
+    # Check if curl.exe is available (compatible with older PowerShell versions)
+    $CurlCommand = Get-Command "curl.exe" -ErrorAction SilentlyContinue
+    if ($CurlCommand) {
+        $CurlPath = $CurlCommand.Source
+    } else {
+        $CurlPath = $null
+    }
+
+    if (-not $CurlPath) {
+        Log-RemoteMessage "curl.exe not found. Using Invoke-WebRequest as fallback." "Yellow"
+
+        try {
+            Invoke-WebRequest -Uri $PatchURL -OutFile $ZipPath -UseBasicParsing
+            if (-not (Test-Path $ZipPath)) {
+                throw "File not downloaded"
+            }
+            Log-RemoteMessage "Patch file downloaded successfully using Invoke-WebRequest." "Green"
+        } catch {
+            Log-RemoteMessage "ERROR: Failed to download patch file using Invoke-WebRequest - $($_.Exception.Message)" "Red"
+            return [PSCustomObject]@{
+                ServerName = $env:COMPUTERNAME
+                Status = "Download Failed"
+                Details = "Patch file not found after Invoke-WebRequest download"
+            }
+        }
+    } else {
+        Log-RemoteMessage "Downloading patch file using curl from $PatchURL to $ZipPath" "Cyan"
+        Start-Process -FilePath $CurlPath -ArgumentList "-# -L -o `"$ZipPath`" $PatchURL" -NoNewWindow -Wait
+        if (-not (Test-Path $ZipPath)) {
+            Log-RemoteMessage "ERROR: Failed to download patch file using curl." "Red"
+            return [PSCustomObject]@{
+                ServerName = $env:COMPUTERNAME
+                Status = "Download Failed"
+                Details = "Patch file not found after curl download"
+            }
+        }
+        Log-RemoteMessage "Patch file downloaded successfully using curl." "Green"
+    }
+
+    Log-RemoteMessage "Starting extraction of $ZipPath to $ExtractedFolder" "Cyan"
+    if (Test-Path -Path $ExtractedFolder) {
+        Remove-Item -Path $ExtractedFolder -Recurse -Force
+        Log-RemoteMessage "Cleared existing folder: $ExtractedFolder" "Yellow"
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    try {
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $ExtractedFolder)
+        Log-RemoteMessage "Patch file successfully extracted to $ExtractedFolder." "Green"
+    } catch {
+        Log-RemoteMessage "ERROR: Extraction failed - $($_.Exception.Message)" "Red"
+        return [PSCustomObject]@{
+            ServerName = $env:COMPUTERNAME
+            Status = "Extraction Failed"
+            Details = $_.Exception.Message
+        }
+    }
+
+    Remove-Item -Path $ZipPath -Force
+    Log-RemoteMessage "Deleted the zip file: $ZipPath" "Gray"
+
+    return [PSCustomObject]@{
+        ServerName = $env:COMPUTERNAME
+        Status = "Success"
+        Details = "Patch file downloaded, extracted, and zip deleted"
+    }
+}
+
+$Servers = Get-Content $ServersFile
+$Jobs = @{}
+foreach ($Server in $Servers) {
+    Log-Message "Starting the process on server: $Server" "Cyan"
+    $Jobs[$Server] = Invoke-Command -ComputerName $Server -ScriptBlock $PatchingScript -ArgumentList $PatchURL, $CentralLogFile -AsJob
+}
+
+while ($Jobs.Values | Where-Object { $_.State -ne 'Completed' }) {
+    Start-Sleep -Seconds 1
+}
+
+$Summary = @()
+foreach ($Server in $Jobs.Keys) {
+    $Job = $Jobs[$Server]
+    $Result = Receive-Job -Job $Job
+    Remove-Job -Job $Job
+
+    foreach ($Log in $Global:LogBuffer) {
+        Add-Content -Path $CentralLogFile -Value $Log
+    }
+
+    $Summary += $Result
+}
+
+$Summary | Export-Csv -Path $CsvOutputFile -NoTypeInformation
+Log-Message "Summary exported to $CsvOutputFile" "Green"

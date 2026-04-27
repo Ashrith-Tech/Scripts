@@ -1,0 +1,246 @@
+# ==========================================================
+# PRODUCTION PATCH ORCHESTRATOR - ENTERPRISE EDITION
+# ==========================================================
+
+# =========================
+# CONFIGURATION
+# =========================
+$ServersFile     = "C:\temp\Patching\servers.txt"
+$PatchURL        = "http://bcfdltcswin03.brunswick.com/patches/02-2022.zip"
+$CentralLogFile  = "C:\temp\Patching\PatchExecutionLog.txt"
+$CsvOutputFile   = "C:\temp\Patching\PatchSummary.csv"
+$ThrottleLimit   = 5
+
+# =========================
+# LOG BUFFER
+# =========================
+$Global:LogBuffer = @()
+
+function Log-Message {
+    param (
+        [string]$Message,
+        [ValidateSet("Green","Yellow","Red","Cyan","Gray")]
+        [string]$Color = "Cyan"
+    )
+
+    Write-Host $Message -ForegroundColor $Color
+    $Global:LogBuffer += "$(Get-Date -Format '[yyyy-MM-dd HH:mm:ss]') $Message"
+}
+
+# =========================
+# REMOTE PATCH SCRIPT
+# =========================
+$RemotePatchScript = {
+
+    param ($PatchURL)
+
+    function Emit-Status {
+        param (
+            [string]$Phase,
+            [string]$Status,
+            [string]$Message
+        )
+
+        [PSCustomObject]@{
+            Time       = Get-Date
+            ServerName = $env:COMPUTERNAME
+            Phase      = $Phase
+            Status     = $Status
+            Message    = $Message
+        }
+    }
+
+    # Prepare paths early (for cleanup access)
+    $Date          = Get-Date -Format "yyyy-MM-dd"
+    $PatchRoot     = "C:\Temp\${Date}_PatchFolder"
+    $ZipPath       = "$PatchRoot\patch.zip"
+    $ExtractedPath = "$PatchRoot\Extracted"
+    $WINUpdatePath = "C:\Temp\WINPatches"
+
+    try {
+
+        # =========================
+        # PRE-CHECK PHASE
+        # =========================
+        $FreeSpaceGB = (Get-PSDrive C).Free / 1GB
+        if ($FreeSpaceGB -lt 5) {
+            Emit-Status "PreCheck" "Failed" "Insufficient disk space (<5GB free)"
+            return
+        }
+
+        $PendingReboot = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
+        if ($PendingReboot) {
+            Emit-Status "PreCheck" "Failed" "Pending reboot detected"
+            return
+        }
+
+        Emit-Status "PreCheck" "Completed" "Pre-check validation passed"
+
+        New-Item -ItemType Directory -Force -Path $PatchRoot, $ExtractedPath, $WINUpdatePath | Out-Null
+
+        # =========================
+        # COPY PHASE (curl + fallback)
+        # =========================
+        Emit-Status "Copy" "Started" "Patch download started"
+
+        $DownloadSuccess = $false
+        $Curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+
+        # Try curl first
+        if ($Curl) {
+            try {
+                $Process = Start-Process `
+                    -FilePath $Curl.Source `
+                    -ArgumentList "-f -L --retry 3 --retry-delay 5 -o `"$ZipPath`" $PatchURL" `
+                    -Wait -PassThru -NoNewWindow
+
+                if ($Process.ExitCode -eq 0 -and (Test-Path $ZipPath)) {
+                    $DownloadSuccess = $true
+                    Emit-Status "Copy" "Completed" "Downloaded using curl"
+                }
+            } catch {}
+        }
+
+        # Fallback to Invoke-WebRequest
+        if (-not $DownloadSuccess) {
+            try {
+                Invoke-WebRequest -Uri $PatchURL -OutFile $ZipPath -UseBasicParsing -ErrorAction Stop
+                if (Test-Path $ZipPath) {
+                    $DownloadSuccess = $true
+                    Emit-Status "Copy" "Completed" "Downloaded using Invoke-WebRequest"
+                }
+            }
+            catch {
+                Emit-Status "Copy" "Failed" $_.Exception.Message
+                return
+            }
+        }
+
+        if (-not $DownloadSuccess) {
+            Emit-Status "Copy" "Failed" "Download failed using both curl and Invoke-WebRequest"
+            return
+        }
+
+        # =========================
+        # INSTALL PHASE
+        # =========================
+        Emit-Status "Install" "Started" "Patch installation started"
+
+        try {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $ExtractedPath)
+
+            $MSUFiles = Get-ChildItem $ExtractedPath -Filter *.msu -Recurse
+            if (!$MSUFiles) { throw "No MSU files found" }
+
+            foreach ($msu in $MSUFiles) {
+                expand.exe -F:* $msu.FullName $WINUpdatePath | Out-Null
+            }
+
+            $CabFiles = Get-ChildItem $WINUpdatePath -Filter *.cab -Recurse
+            if (!$CabFiles) { throw "No CAB files found for installation" }
+
+            foreach ($cab in $CabFiles) {
+                $Process = Start-Process dism.exe `
+                    -ArgumentList "/Online /Add-Package /PackagePath:`"$($cab.FullName)`" /quiet /norestart" `
+                    -Wait -PassThru -NoNewWindow
+
+                if ($Process.ExitCode -ne 0) {
+                    throw "DISM failed with exit code $($Process.ExitCode)"
+                }
+            }
+
+            Emit-Status "Install" "Completed" "Patch installation completed successfully"
+        }
+        catch {
+            Emit-Status "Install" "Failed" $_.Exception.Message
+            return
+        }
+
+    }
+    catch {
+        Emit-Status "General" "Failed" $_.Exception.Message
+    }
+    finally {
+
+        # =========================
+        # CLEANUP PHASE (ALWAYS RUNS)
+        # =========================
+        Emit-Status "Cleanup" "Started" "Starting cleanup"
+
+        try {
+            if (Test-Path $WINUpdatePath) {
+                Remove-Item $WINUpdatePath -Recurse -Force -ErrorAction Stop
+            }
+
+            if (Test-Path $PatchRoot) {
+                Remove-Item $PatchRoot -Recurse -Force -ErrorAction Stop
+            }
+
+            Emit-Status "Cleanup" "Completed" "Temporary files removed successfully"
+        }
+        catch {
+            Emit-Status "Cleanup" "Warning" "Cleanup issue: $($_.Exception.Message)"
+        }
+    }
+}
+
+# =========================
+# EXECUTION SECTION
+# =========================
+$Servers = Get-Content $ServersFile
+
+Log-Message "============================================" "Gray"
+Log-Message "Starting Production Patch Orchestration" "Yellow"
+Log-Message "Throttle limit: $ThrottleLimit servers at a time" "Yellow"
+Log-Message "============================================" "Gray"
+
+$Job = Invoke-Command `
+    -ComputerName $Servers `
+    -ScriptBlock $RemotePatchScript `
+    -ArgumentList $PatchURL `
+    -ThrottleLimit $ThrottleLimit `
+    -AsJob
+
+$AllResults = @()
+
+# Real-time monitoring
+while ($Job.State -eq "Running" -or $Job.HasMoreData) {
+
+    $Data = Receive-Job $Job
+
+    foreach ($Item in $Data) {
+
+        $Color = switch ($Item.Status) {
+            "Started"   { "Cyan" }
+            "Completed" { "Green" }
+            "Failed"    { "Red" }
+            "Warning"   { "Yellow" }
+            default     { "Gray" }
+        }
+
+        Log-Message "$($Item.ServerName) | $($Item.Phase) | $($Item.Status) | $($Item.Message)" $Color
+
+        if ($Item.Status -eq "Failed") {
+            Log-Message "⚠ Immediate attention required on $($Item.ServerName)" "Red"
+        }
+
+        $AllResults += $Item
+    }
+
+    Start-Sleep 5
+}
+
+Remove-Job $Job
+
+# =========================
+# EXPORT REPORTS
+# =========================
+$AllResults | Export-Csv $CsvOutputFile -NoTypeInformation
+$Global:LogBuffer | Add-Content $CentralLogFile
+
+Log-Message "============================================" "Gray"
+Log-Message "Patch execution completed on all servers" "Green"
+Log-Message "CSV Report: $CsvOutputFile" "Green"
+Log-Message "Central Log: $CentralLogFile" "Green"
+Log-Message "============================================" "Gray"

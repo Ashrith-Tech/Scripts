@@ -1,0 +1,195 @@
+# ==========================================================
+# Server Restart & Validation GUI Tool
+# Author: Senior Windows / PowerShell Admin
+# ==========================================================
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# -------------------------
+# FUNCTION: WAIT FOR SERVER
+# -------------------------
+function Wait-ForServer {
+    param (
+        [string]$Server,
+        [int]$TimeoutMinutes = 15
+    )
+
+    $StartTime = Get-Date
+
+    while ((Get-Date) -lt $StartTime.AddMinutes($TimeoutMinutes)) {
+
+        # Ping check
+        if (Test-Connection -ComputerName $Server -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+
+            # WinRM check
+            try {
+                Test-WSMan -ComputerName $Server -ErrorAction Stop | Out-Null
+                return $true
+            }
+            catch {
+                Start-Sleep -Seconds 15
+            }
+        }
+        else {
+            Start-Sleep -Seconds 15
+        }
+    }
+
+    return $false
+}
+
+# -------------------------
+# FORM
+# -------------------------
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Server Restart & Health Check Tool"
+$form.Size = New-Object System.Drawing.Size(650,520)
+$form.StartPosition = "CenterScreen"
+
+# -------------------------
+# SERVER INPUT
+# -------------------------
+$lblServers = New-Object System.Windows.Forms.Label
+$lblServers.Text = "Enter Server Names (one per line):"
+$lblServers.Location = New-Object System.Drawing.Point(20,15)
+$form.Controls.Add($lblServers)
+
+$txtServers = New-Object System.Windows.Forms.TextBox
+$txtServers.Multiline = $true
+$txtServers.ScrollBars = "Vertical"
+$txtServers.Size = New-Object System.Drawing.Size(590,260)
+$txtServers.Location = New-Object System.Drawing.Point(20,40)
+$form.Controls.Add($txtServers)
+
+# -------------------------
+# STATUS LABEL
+# -------------------------
+$statusLabel = New-Object System.Windows.Forms.Label
+$statusLabel.Text = "Status: Waiting for input..."
+$statusLabel.AutoSize = $true
+$statusLabel.Location = New-Object System.Drawing.Point(20,430)
+$form.Controls.Add($statusLabel)
+
+# -------------------------
+# BUTTONS
+# -------------------------
+$btnRestart = New-Object System.Windows.Forms.Button
+$btnRestart.Text = "Restart Servers"
+$btnRestart.Size = New-Object System.Drawing.Size(160,40)
+$btnRestart.Location = New-Object System.Drawing.Point(20,320)
+$form.Controls.Add($btnRestart)
+
+$btnExport = New-Object System.Windows.Forms.Button
+$btnExport.Text = "Export CSV"
+$btnExport.Size = New-Object System.Drawing.Size(160,40)
+$btnExport.Location = New-Object System.Drawing.Point(200,320)
+$btnExport.Enabled = $false
+$form.Controls.Add($btnExport)
+
+# -------------------------
+# DATA STORE
+# -------------------------
+$global:Results = @()
+
+# -------------------------
+# RESTART BUTTON ACTION
+# -------------------------
+$btnRestart.Add_Click({
+
+    $Servers = $txtServers.Lines | Where-Object { $_.Trim() -ne "" }
+
+    if ($Servers.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Please enter at least one server.")
+        return
+    }
+
+    $btnRestart.Enabled = $false
+    $btnExport.Enabled = $false
+    $global:Results = @()
+
+    $statusLabel.Text = "Restarting servers in parallel..."
+    $form.Refresh()
+
+    Invoke-Command -ComputerName $Servers -ScriptBlock {
+        Restart-Computer -Force
+    } -AsJob | Out-Null
+
+    foreach ($Server in $Servers) {
+
+        $statusLabel.Text = "Waiting for $Server to come online..."
+        $form.Refresh()
+
+        $Ready = Wait-ForServer -Server $Server -TimeoutMinutes 30
+
+        if ($Ready) {
+            try {
+                $OS = Invoke-Command -ComputerName $Server {
+                    Get-CimInstance Win32_OperatingSystem
+                }
+
+                $LastBoot = $OS.LastBootUpTime
+                $Uptime = (New-TimeSpan -Start $LastBoot -End (Get-Date)).TotalHours
+
+                $StoppedAuto = Invoke-Command -ComputerName $Server {
+                    Get-Service |
+                    Where-Object {
+                        $_.StartType -eq 'Automatic' -and $_.Status -ne 'Running'
+                    } |
+                    Select-Object -ExpandProperty Name
+                }
+
+                $global:Results += [PSCustomObject]@{
+                    ServerName          = $Server
+                    RestartStatus       = "Online"
+                    LastBootTime        = $LastBoot
+                    UptimeHours         = [math]::Round($Uptime,2)
+                    StoppedAutoServices = if ($StoppedAuto) { $StoppedAuto -join ";" } else { "None" }
+                }
+            }
+            catch {
+                $global:Results += [PSCustomObject]@{
+                    ServerName          = $Server
+                    RestartStatus       = "Online - Data Collection Error"
+                    LastBootTime        = "N/A"
+                    UptimeHours         = "N/A"
+                    StoppedAutoServices = "N/A"
+                }
+            }
+        }
+        else {
+            $global:Results += [PSCustomObject]@{
+                ServerName          = $Server
+                RestartStatus       = "Not reachable after reboot"
+                LastBootTime        = "N/A"
+                UptimeHours         = "N/A"
+                StoppedAutoServices = "N/A"
+            }
+        }
+    }
+
+    $statusLabel.Text = "Completed. Ready to export CSV."
+    $btnRestart.Enabled = $true
+    $btnExport.Enabled = $true
+})
+
+# -------------------------
+# EXPORT BUTTON ACTION
+# -------------------------
+$btnExport.Add_Click({
+
+    $SaveDialog = New-Object System.Windows.Forms.SaveFileDialog
+    $SaveDialog.Filter = "CSV Files (*.csv)|*.csv"
+    $SaveDialog.FileName = "ServerRestartReport_$(Get-Date -Format yyyyMMdd_HHmm).csv"
+
+    if ($SaveDialog.ShowDialog() -eq "OK") {
+        $global:Results | Export-Csv -Path $SaveDialog.FileName -NoTypeInformation
+        [System.Windows.Forms.MessageBox]::Show("CSV exported successfully.")
+    }
+})
+
+# -------------------------
+# SHOW FORM
+# -------------------------
+$form.Add_Shown({ $form.Activate() })
+[void]$form.ShowDialog()

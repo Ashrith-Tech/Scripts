@@ -1,0 +1,181 @@
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# ------------ GUI Layout ------------
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Sequential Server Reboot & Service Validation"
+$form.Size = New-Object System.Drawing.Size(600, 600)
+$form.StartPosition = "CenterScreen"
+
+$lblServers = New-Object System.Windows.Forms.Label
+$lblServers.Text = "Enter server names (one per line):"
+$lblServers.Location = New-Object System.Drawing.Point(20, 20)
+$lblServers.Size = New-Object System.Drawing.Size(400, 20)
+$form.Controls.Add($lblServers)
+
+$txtServers = New-Object System.Windows.Forms.TextBox
+$txtServers.Multiline = $true
+$txtServers.ScrollBars = "Vertical"
+$txtServers.Location = New-Object System.Drawing.Point(20, 50)
+$txtServers.Size = New-Object System.Drawing.Size(540, 180)
+$form.Controls.Add($txtServers)
+
+$btnStart = New-Object System.Windows.Forms.Button
+$btnStart.Text = "Start Reboot Process"
+$btnStart.Location = New-Object System.Drawing.Point(20, 250)
+$btnStart.Size = New-Object System.Drawing.Size(200, 40)
+$form.Controls.Add($btnStart)
+
+$txtOutput = New-Object System.Windows.Forms.TextBox
+$txtOutput.Multiline = $true
+$txtOutput.ScrollBars = "Vertical"
+$txtOutput.ReadOnly = $true
+$txtOutput.Location = New-Object System.Drawing.Point(20, 310)
+$txtOutput.Size = New-Object System.Drawing.Size(540, 230)
+$form.Controls.Add($txtOutput)
+
+
+# ----------------- FUNCTIONS -----------------
+
+function Log {
+    param([string]$msg)
+    $txtOutput.AppendText("$(Get-Date -Format 'HH:mm:ss') - $msg`r`n")
+    $txtOutput.Refresh()
+}
+
+function Wait-ForServerOnline {
+    param(
+        [string]$ComputerName,
+        [int]$PingTimeout = 900,     # 15 min
+        [int]$WinRMTimeout = 600     # 10 min
+    )
+
+    Log "Waiting for $ComputerName to respond to ping..."
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    # ----------------------------
+    # Wait for Ping
+    # ----------------------------
+    while ($stopwatch.Elapsed.TotalSeconds -lt $PingTimeout) {
+        if (Test-Connection -ComputerName $ComputerName -Count 1 -Quiet) {
+            Log "$ComputerName ping response detected."
+            break
+        }
+        Start-Sleep -Seconds 5
+    }
+
+    if ($stopwatch.Elapsed.TotalSeconds -ge $PingTimeout) {
+        Log "[ERROR] $ComputerName did NOT respond to ping in $PingTimeout seconds."
+        return $false
+    }
+
+    # ----------------------------
+    # Wait for WinRM
+    # ----------------------------
+    Log "Waiting for WinRM to become available on $ComputerName..."
+    $winRMStart = Get-Date
+
+    while ((New-TimeSpan -Start $winRMStart -End (Get-Date)).TotalSeconds -lt $WinRMTimeout) {
+
+        try {
+            Test-WSMan -ComputerName $ComputerName -ErrorAction Stop | Out-Null
+            Log "WinRM is online for $ComputerName."
+            return $true
+        }
+        catch {
+            Start-Sleep -Seconds 5
+        }
+    }
+
+    Log "[WARNING] WinRM did NOT become available within $WinRMTimeout seconds. Continuing anyway."
+    return $false
+}
+
+function Validate-AutomaticServices {
+    param($Servers)
+
+    $results = @()
+
+    foreach ($server in $Servers) {
+        Log "Validating Automatic services on $server..."
+
+        try {
+            $services = Get-Service -ComputerName $server |
+                        Where-Object { $_.StartType -eq "Automatic" }
+
+            foreach ($svc in $services) {
+                if ($svc.Status -ne "Running") {
+                    $results += [PSCustomObject]@{
+                        Server      = $server
+                        ServiceName = $svc.Name
+                        DisplayName = $svc.DisplayName
+                        Status      = $svc.Status
+                    }
+                }
+            }
+        }
+        catch {
+            Log "Error checking services on $server : $_"
+        }
+    }
+
+    return $results
+}
+
+
+# ----------------- MAIN PROCESS -----------------
+
+$btnStart.Add_Click({
+
+    # Read server names properly
+    $Servers = $txtServers.Lines |
+               ForEach-Object { $_.Trim() } |
+               Where-Object { $_ -ne "" }
+
+    if ($Servers.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Please enter at least one server.")
+        return
+    }
+
+    Log "Starting reboot sequence for $($Servers.Count) servers..."
+
+    foreach ($server in $Servers) {
+
+        Log "Sending reboot command to $server ..."
+       try {
+    Invoke-Command -ComputerName $server -ScriptBlock {
+        Restart-Computer -Force
+    } -ErrorAction Stop
+
+    Log "$server reboot command sent successfully."
+}
+catch {
+    Log "[ERROR] Could not reboot $server : $($_.Exception.Message)"
+    continue
+}
+
+
+        # Wait until server is online
+        Wait-ForServerOnline -ComputerName $server | Out-Null
+
+        Log "Waiting 5 minutes before rebooting next server..."
+        Start-Sleep -Seconds 300   # <<< 5 minutes
+    }
+
+    Log "All reboots completed. Starting Automatic services validation..."
+
+    if (!(Test-Path "C:\Temp")) { New-Item -ItemType Directory -Path "C:\Temp" | Out-Null }
+
+    $csvPath = "C:\Temp\AutomaticServiceValidation.csv"
+    $results = Validate-AutomaticServices -Servers $Servers
+    $results | Export-Csv -Path $csvPath -NoTypeInformation
+
+    Log "Validation complete. CSV saved: $csvPath"
+
+    [System.Windows.Forms.MessageBox]::Show("Process Completed! Report saved to $csvPath")
+})
+
+
+# ------------ RUN GUI ------------
+$form.ShowDialog()

@@ -1,0 +1,52 @@
+# Path to server list
+$ServerList = "D:\Windows_Team\Scripts\Patching\C drive\servers.txt"
+
+# Read all server names
+$Servers = Get-Content -Path $ServerList
+
+# Output array
+$results = @()
+
+foreach ($server in $Servers) {
+    try {
+        # Query C: drive remotely
+        $disk = Get-WmiObject -Class Win32_LogicalDisk `
+            -ComputerName $server `
+            -Filter "DeviceID='C:'" `
+            -ErrorAction Stop
+
+        if ($disk) {
+            $results += [PSCustomObject]@{
+                Server       = $server
+                TotalGB      = [math]::Round($disk.Size / 1GB, 2)
+                FreeGB       = [math]::Round($disk.FreeSpace / 1GB, 2)
+                FreePercent  = [math]::Round(($disk.FreeSpace / $disk.Size) * 100, 2)
+                Status       = "Success"
+            }
+        }
+        else {
+            $results += [PSCustomObject]@{
+                Server       = $server
+                TotalGB      = "-"
+                FreeGB       = "-"
+                FreePercent  = "-"
+                Status       = "C drive not found"
+            }
+        }
+    }
+    catch {
+        $results += [PSCustomObject]@{
+            Server       = $server
+            TotalGB      = "-"
+            FreeGB       = "-"
+            FreePercent  = "-"
+            Status       = "Error: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Show output
+$results | Format-Table -AutoSize
+
+# Export (optional)
+$results | Export-Csv "D:\Windows_Team\Scripts\Patching\C drive\CDriveReport.csv" -NoTypeInformation
